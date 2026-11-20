@@ -1,0 +1,122 @@
+name: Manus issue-to-code proposal
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Open issue number to turn into a code proposal
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: read
+  pull-requests: write
+
+concurrency:
+  group: manus-issue-to-code-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate-proposal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve issue number
+        id: issue
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_ISSUE: ${{ inputs.issue_number }}
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import re
+
+          event_name = os.environ["EVENT_NAME"]
+          if event_name == "workflow_dispatch":
+              number = os.environ.get("DISPATCH_ISSUE", "").strip()
+              if not re.fullmatch(r"[1-9][0-9]{0,8}", number):
+                  raise SystemExit("Enter a valid positive issue number.")
+          else:
+              with open(os.environ["EVENT_PATH"], encoding="utf-8") as f:
+                  event = json.load(f)
+              message = (event.get("head_commit") or {}).get("message", "")
+              matches = re.findall(r"(?<![A-Za-z0-9_/])#([1-9][0-9]*)\b", message)
+              number = matches[-1] if matches else ""
+              if not number:
+                  print("No issue reference such as #123 in the push commit message; nothing to do.")
+          print(f"issue_number={number}")
+          PY
+
+      - name: Read and validate issue
+        if: steps.issue.outputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" > "$RUNNER_TEMP/issue.json"
+          python - <<'PY'
+          import json
+          import os
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "issue.json"), encoding="utf-8") as f:
+              issue = json.load(f)
+          if issue.get("pull_request"):
+              raise SystemExit("The selected number is a pull request, not an issue.")
+          if issue.get("state") != "open":
+              raise SystemExit("The selected issue is not open.")
+          PY
+
+      - name: Skip if an open proposal already exists
+        id: existing
+        if: steps.issue.outputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
+        run: |
+          branch="manus/issue-${ISSUE_NUMBER}"
+          url="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$branch" --json url --jq '.[0].url // ""')"
+          if [ -n "$url" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "url=$url" >> "$GITHUB_OUTPUT"
+            echo "An open proposal already exists: $url"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ask Manus for a patch
+        id: manus
+        if: steps.issue.outputs.issue_number != '' && steps.existing.outputs.exists != 'true'
+        env:
+          MANUS_API_KEY: ${{ secrets.MANUS_API_KEY }}
+          ISSUE_JSON: ${{ runner.temp }}/issue.json
+          PATCH_FILE: ${{ runner.temp }}/issue.patch
+          RESULT_FILE: ${{ runner.temp }}/manus-result.json
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/manus_issue_code.py
+
+      - name: Open a review pull request
+        if: steps.manus.outputs.has_patch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          ISSUE_JSON: ${{ runner.temp }}/issue.json
+          PATCH_FILE: ${{ runner.temp }}/issue.patch
+          RESULT_FILE: ${{ runner.temp }}/manus-result.json
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/create_issue_pr.py
